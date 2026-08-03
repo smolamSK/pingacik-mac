@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        run: swift test
+
+  app-bundle:
+    name: App bundle assembles
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Build dist/Pingacik.app
+        run: ./Scripts/build-app.sh
+
+      - name: Verify bundle structure
+        run: |
+          test -f dist/Pingacik.app/Contents/MacOS/Pingacik
+          test -f dist/Pingacik.app/Contents/Resources/AppIcon.icns
+          test -f dist/Pingacik.app/Contents/Info.plist
+          plutil -lint dist/Pingacik.app/Contents/Info.plist
