@@ -17,6 +17,10 @@ let package = Package(
         .testTarget(
             name: "PingacikCoreTests",
             dependencies: ["PingacikCore"]
+        ),
+        .testTarget(
+            name: "PingacikTests",
+            dependencies: ["Pingacik"]
         )
     ]
 )

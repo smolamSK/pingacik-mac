@@ -1,108 +1,181 @@
 import Foundation
 import Combine
+import AppKit
 import PingacikCore
 
-/// Wires `Config`, `PingRunner` and the hysteresis state machine together,
-/// publishing the live values the menu bar UI observes. Mirrors the root
-/// properties of `main.qml`.
 @MainActor
 final class PingMonitor: ObservableObject {
+    enum Activity: Equatable { case checking, live, paused, stale }
+
     private let config: Config
-    private let runner: PingRunner
+    private let runner: PingRunning
     private var machine = PingStateMachine()
     private var cancellables = Set<AnyCancellable>()
+    private var session = UUID()
+    private var sleeping = false
+    private var waitingSince = Date()
+    private var awaitingFreshSample = true
+    private var stopped = false
 
-    private let bufferCap = 3600 // 1 h at 1 s
-    let logCap = 500
-
+    @Published private(set) var target: MonitoringTarget
     @Published private(set) var samples: [PingSample] = []
     @Published private(set) var connectionStatus: ConnectionStatus = .ok
-    @Published private(set) var lastRtt: Double = -1
-    @Published private(set) var lastOk = false
-    @Published private(set) var sampleCount = 0
-    @Published private(set) var avgRtt: Double = -1
-    @Published private(set) var minRtt: Double = -1
-    @Published private(set) var maxRtt: Double = -1
-    @Published private(set) var lossPercent: Double = 0
+    @Published private(set) var activity: Activity = .checking
+    @Published private(set) var isPaused = false
+    @Published private(set) var recoveryCount = 0
 
-    /// The most recent samples, newest first, for the log list.
-    var recentLog: [PingSample] {
-        Array(samples.suffix(logCap).reversed())
-    }
+    var host: String { target.host }
+    var latest: PingSample? { samples.last }
+    var sampleCount: Int { samples.count }
+    var lastRtt: Double { latest?.rtt ?? -1 }
+    var lastOk: Bool { latest?.ok ?? false }
+    var recentLog: [PingSample] { Array(samples.suffix(50).reversed()) }
+    var isNeutral: Bool { activity != .live }
 
-    var host: String { config.host }
-
-    init(config: Config) {
-        self.config = config
-        self.runner = PingRunner(
-            host: config.host,
-            pingIntervalSeconds: config.pingInterval,
-            pingTimeoutSeconds: config.pingTimeout
-        )
-
-        runner.onSample = { [weak self] sample in
-            // PingRunner always delivers on the main queue.
-            MainActor.assumeIsolated {
-                self?.recordSample(sample)
+    var statusText: String {
+        switch activity {
+        case .checking: return "Checking"
+        case .paused: return "Paused"
+        case .stale: return "No recent data"
+        case .live:
+            if recoveryCount > 0 && connectionStatus != .ok { return "Recovering" }
+            if latest?.failure == .dns || latest?.failure == .launch || latest?.failure == .execution || latest?.failure == .invalidReply {
+                return "Check target"
+            }
+            if connectionStatus == .ok && !lastOk { return "Missed reply" }
+            switch connectionStatus {
+            case .ok: return "OK"
+            case .warning: return "Warning"
+            case .critical: return "Critical"
             }
         }
-
-        // Changing what or how we measure invalidates the history, same as
-        // onHostChanged/onPingIntervalChanged/onPingTimeoutChanged in main.qml.
-        Publishers.Merge3(
-            config.$host.dropFirst().map { _ in () },
-            config.$pingInterval.dropFirst().map { _ in () },
-            config.$pingTimeout.dropFirst().map { _ in () }
-        )
-        .sink { [weak self] in self?.restartSampler() }
-        .store(in: &cancellables)
-
-        runner.start()
     }
 
-    /// Buckets covering the last `seconds`, downsampled for the chart.
-    func buckets(overLast seconds: Double, targetPoints: Int = 300) -> [RTTBucket] {
-        downsample(windowSlice(samples, seconds: seconds, now: Date()), targetPoints: targetPoints)
+    var statusDetail: String {
+        switch activity {
+        case .checking: return "Waiting for a fresh measurement…"
+        case .paused: return "Monitoring is paused. History is preserved."
+        case .stale: return sleeping ? "Waiting for your Mac to wake." : "Measurements are out of date."
+        case .live:
+            if recoveryCount > 0 && connectionStatus != .ok {
+                return "\(recoveryCount) of \(config.recoverAfter) good replies to recover"
+            }
+            if let failure = latest?.failure { return failure.rawValue }
+            return "One probe every \(target.interval)s · timeout \(target.timeout)s"
+        }
     }
 
-    /// Aggregate stats over the last `seconds`, for the popup header.
-    func stats(overLast seconds: Double) -> PingStats {
-        PingacikCore.stats(windowSlice(samples, seconds: seconds, now: Date()))
+    var displayStatus: ConnectionStatus {
+        if activity == .live, let latest, !latest.ok { return max(connectionStatus, .warning) }
+        return connectionStatus
     }
 
-    private func restartSampler() {
-        resetHistory()
-        runner.updateTarget(
-            host: config.host,
-            pingIntervalSeconds: config.pingInterval,
-            pingTimeoutSeconds: config.pingTimeout
-        )
+    init(config: Config, runner: PingRunning = PingRunner(), observeLifecycle: Bool = true) {
+        self.config = config
+        self.runner = runner
+        target = MonitoringTarget(host: config.host, interval: config.pingInterval, timeout: config.pingTimeout)
+        runner.onSample = { [weak self] sample, token in
+            MainActor.assumeIsolated { self?.recordSample(sample, session: token) }
+        }
+
+        // Consume published values, which arrive before the properties are stored.
+        Publishers.CombineLatest3(config.$host, config.$pingInterval, config.$pingTimeout)
+            .map { MonitoringTarget(host: $0, interval: $1, timeout: $2) }
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] target in self?.changeTarget(target) }
+            .store(in: &cancellables)
+
+        if observeLifecycle {
+            let center = NSWorkspace.shared.notificationCenter
+            center.publisher(for: NSWorkspace.willSleepNotification)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.prepareForSleep() }
+                .store(in: &cancellables)
+            center.publisher(for: NSWorkspace.didWakeNotification)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.wake() }
+                .store(in: &cancellables)
+            Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+                .sink { [weak self] now in self?.checkFreshness(now: now) }
+                .store(in: &cancellables)
+        }
+        beginSampling()
     }
 
-    private func resetHistory() {
+    func samples(overLast seconds: Double, now: Date = Date()) -> [PingSample] {
+        Array(windowSlice(samples, seconds: seconds, now: now))
+    }
+
+    func togglePause() {
+        isPaused.toggle()
+        invalidateSession()
+        if isPaused { activity = .paused }
+        else if sleeping { activity = .stale }
+        else { beginSampling() }
+    }
+
+    func prepareForSleep() {
+        sleeping = true
+        invalidateSession()
+        if !isPaused { activity = .stale }
+    }
+
+    func wake() {
+        sleeping = false
+        if !isPaused { beginSampling() }
+    }
+
+    func shutdown() {
+        stopped = true
+        invalidateSession()
+        cancellables.removeAll()
+    }
+
+    func checkFreshness(now: Date) {
+        guard !isPaused, !sleeping, !stopped else { return }
+        let reference = awaitingFreshSample ? waitingSince : (latest?.t ?? waitingSince)
+        if now.timeIntervalSince(reference) > Double(target.interval + target.timeout + 4) {
+            activity = .stale
+        }
+    }
+
+    private func invalidateSession() {
+        session = UUID()
+        runner.stop()
+    }
+
+    private func changeTarget(_ newTarget: MonitoringTarget) {
+        invalidateSession()
+        target = newTarget
         samples = []
         machine = PingStateMachine()
         connectionStatus = .ok
-        lastRtt = -1
-        lastOk = false
-        sampleCount = 0
-        avgRtt = -1
-        minRtt = -1
-        maxRtt = -1
-        lossPercent = 0
+        recoveryCount = 0
+        if !isPaused && !sleeping { beginSampling() }
     }
 
-    private func recordSample(_ sample: PingSample) {
-        pushSample(&samples, sample, cap: bufferCap)
-        connectionStatus = machine.advance(with: sample, thresholds: config.thresholds)
-        lastOk = sample.ok
-        lastRtt = sample.rtt
-        sampleCount = samples.count
+    private func beginSampling() {
+        guard !stopped else { return }
+        session = UUID()
+        waitingSince = Date()
+        awaitingFreshSample = true
+        machine = PingStateMachine()
+        connectionStatus = .ok
+        recoveryCount = 0
+        activity = .checking
+        runner.start(target: target, session: session)
+    }
 
-        let s = PingacikCore.stats(samples)
-        avgRtt = s.avg
-        minRtt = s.min
-        maxRtt = s.max
-        lossPercent = s.lossPercent
+    private func recordSample(_ sample: PingSample, session token: UUID) {
+        guard token == session, !isPaused, !sleeping, !stopped else { return }
+        var sample = sample
+        sample.sessionID = token
+        if activity == .stale { machine = PingStateMachine() }
+        pushSample(&samples, sample, cap: 3600)
+        connectionStatus = machine.advance(with: sample, thresholds: config.thresholds)
+        recoveryCount = machine.consecutiveGood
+        awaitingFreshSample = false
+        activity = .live
     }
 }

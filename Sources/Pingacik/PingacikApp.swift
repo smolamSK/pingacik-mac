@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var popover: NSPopover?
     private var settingsWindowController: NSWindowController?
     private var monitorSubscription: AnyCancellable?
+    private var configSubscription: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -29,7 +30,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monitorSubscription = monitor.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.layoutStatusItem() }
         }
+        configSubscription = config.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.layoutStatusItem() }
+        }
     }
+
+    func applicationWillTerminate(_ notification: Notification) { monitor.shutdown() }
 
     private func setUpStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -50,14 +56,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layoutStatusItem()
     }
 
-    /// Resizes the status item to fit the label's current content — the
-    /// latency text's width changes as the RTT does, same as the plasmoid's
-    /// panel dot growing/shrinking with its text.
+    /// Latency reserves a stable width; appearance changes can still resize the item.
     private func layoutStatusItem() {
         guard let button = statusItem?.button, let hosting = labelHostingView else { return }
         let size = hosting.fittingSize
         hosting.frame = NSRect(x: 0, y: (button.bounds.height - size.height) / 2, width: size.width, height: size.height)
         statusItem?.length = max(size.width, 22)
+        button.toolTip = "Pingacik · \(monitor.host) · \(monitor.statusText)\n\(monitor.statusDetail)"
+        button.setAccessibilityLabel("Pingacik, \(monitor.host), \(monitor.statusText)")
+        button.setAccessibilityValue(monitor.activity == .live && monitor.lastOk ? "\(Int(monitor.lastRtt.rounded())) milliseconds" : monitor.statusDetail)
     }
 
     private func setUpPopover() {

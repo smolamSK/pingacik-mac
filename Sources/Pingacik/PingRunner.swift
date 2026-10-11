@@ -1,165 +1,122 @@
 import Foundation
 import PingacikCore
 
-/// Runs `ping` against a host on an interval, one process in flight at a
-/// time, and hands each parsed result back via `onSample`.
-///
-/// Port of `main.qml`'s sampler: the next ping is scheduled from when the
-/// *previous one started* (not when it finished) so the cadence holds at
-/// `pingInterval` regardless of round-trip time, and a watchdog force-
-/// completes the sample if the process never reports back at all.
-///
-/// All mutable state is confined to `queue`; `onSample` is always delivered
-/// on the main queue since it feeds an `ObservableObject`.
-final class PingRunner: @unchecked Sendable {
+protocol PingRunning: AnyObject {
+    var onSample: (@Sendable (PingSample, UUID) -> Void)? { get set }
+    func start(target: MonitoringTarget, session: UUID)
+    func stop()
+}
+
+/// Mutable process state stays on a serial queue; samples are delivered on the main queue.
+final class PingRunner: PingRunning, @unchecked Sendable {
     private let queue = DispatchQueue(label: "pingacik.pingrunner")
-
-    private var host: String
-    private var intervalMs: Double
-    private var timeoutMs: Double
-    private let minGapMs: Double = 50
-
+    private var target = MonitoringTarget(host: "8.8.8.8", interval: 1, timeout: 1)
+    private var session = UUID()
+    private var request: UUID?
     private var process: Process?
-    private var busy = false
-    private var lastStart = Date.distantPast
-    private var watchdogWorkItem: DispatchWorkItem?
-    private var scheduledWorkItem: DispatchWorkItem?
-    private var generation = 0
+    private var startedAt = Date()
+    private var startedClock = DispatchTime.now()
+    private var watchdog: DispatchWorkItem?
+    private var scheduled: DispatchWorkItem?
+    private var handler: (@Sendable (PingSample, UUID) -> Void)?
 
-    var onSample: (@Sendable (PingSample) -> Void)?
+    // Set before starting. Each start captures its callback for the worker queue.
+    var onSample: (@Sendable (PingSample, UUID) -> Void)?
 
-    init(host: String, pingIntervalSeconds: Int, pingTimeoutSeconds: Int) {
-        self.host = host
-        self.intervalMs = Double(pingIntervalSeconds) * 1000
-        self.timeoutMs = Double(pingTimeoutSeconds) * 1000
-    }
-
-    /// (Re)start sampling with the current target. Cancels any in-flight
-    /// ping so its result can't be attributed to a target that's already
-    /// changed.
-    func start() {
-        queue.async { self.restartLocked() }
-    }
-
-    func stop() {
-        queue.async { self.stopLocked() }
-    }
-
-    /// Changing what or how we measure invalidates any in-flight ping and
-    /// restarts sampling, mirroring `onHostChanged`/`onPingIntervalChanged`/
-    /// `onPingTimeoutChanged` in `main.qml`.
-    func updateTarget(host: String, pingIntervalSeconds: Int, pingTimeoutSeconds: Int) {
+    func start(target: MonitoringTarget, session: UUID) {
+        let callback = onSample
         queue.async {
-            self.host = host
-            self.intervalMs = Double(pingIntervalSeconds) * 1000
-            self.timeoutMs = Double(pingTimeoutSeconds) * 1000
-            self.restartLocked()
+            self.stopLocked()
+            self.target = target
+            self.session = session
+            self.handler = callback
+            self.doPing()
         }
     }
 
-    // MARK: - Queue-confined implementation
-
-    private func restartLocked() {
-        stopLocked()
-        doPing()
-    }
+    func stop() { queue.async { self.stopLocked() } }
 
     private func stopLocked() {
-        generation += 1 // invalidate any in-flight callbacks
-        scheduledWorkItem?.cancel()
-        watchdogWorkItem?.cancel()
-        scheduledWorkItem = nil
-        watchdogWorkItem = nil
+        request = nil
+        session = UUID()
+        scheduled?.cancel()
+        watchdog?.cancel()
+        scheduled = nil
+        watchdog = nil
         if let process, process.isRunning {
             process.terminationHandler = nil
             process.terminate()
         }
         process = nil
-        busy = false
     }
 
     private func doPing() {
-        guard !busy else { return }
-        busy = true
-        lastStart = Date()
-        let myGeneration = generation
+        guard request == nil else { return }
+        let requestID = UUID()
+        request = requestID
+        startedAt = Date()
+        startedClock = .now()
 
-        let watchdogItem = DispatchWorkItem { [weak self] in
-            self?.queue.async { self?.handleWatchdogFired(generation: myGeneration) }
-        }
-        watchdogWorkItem = watchdogItem
-        queue.asyncAfter(deadline: .now() + (timeoutMs / 1000) + 5, execute: watchdogItem)
+        let work = DispatchWorkItem { [weak self] in self?.timedOut(requestID) }
+        watchdog = work
+        queue.asyncAfter(deadline: .now() + Double(target.timeout) + 2, execute: work)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/sbin/ping")
-        proc.arguments = ["-n", "-c", "1", "-W", String(Int(timeoutMs)), host]
+        // -t bounds the whole command; -W alone only controls reply acceptance on macOS.
+        proc.arguments = ["-n", "-c", "1", "-W", String(target.timeout * 1000), "-t", String(target.timeout), target.host]
         proc.environment = ["LC_ALL": "C"]
-
-        let outPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = Pipe()
-
+        let output = Pipe()
+        let errors = Pipe()
+        proc.standardOutput = output
+        proc.standardError = errors
         process = proc
-
         proc.terminationHandler = { [weak self] finished in
-            let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let stdout = String(data: data, encoding: .utf8)
-            let exitCode = finished.terminationStatus
-            self?.queue.async {
-                self?.handleProcessFinished(stdout: stdout, exitCode: exitCode, generation: myGeneration)
-            }
+            let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            let code = finished.terminationStatus
+            self?.queue.async { self?.finished(requestID, stdout: stdout, stderr: stderr, code: code) }
         }
-
-        do {
-            try proc.run()
-        } catch {
-            queue.async { [weak self] in
-                self?.handleProcessFinished(stdout: nil, exitCode: -1, generation: myGeneration)
-            }
-        }
+        do { try proc.run() }
+        catch { finished(requestID, stdout: nil, stderr: error.localizedDescription, code: -1) }
     }
 
-    private func handleProcessFinished(stdout: String?, exitCode: Int32, generation: Int) {
-        // Dropped by the watchdog already, or superseded by a restart:
-        // ignore the late arrival rather than attributing it to a request
-        // that's no longer outstanding.
-        guard generation == self.generation, busy else { return }
-        busy = false
-        watchdogWorkItem?.cancel()
-        watchdogWorkItem = nil
+    private func finished(_ id: UUID, stdout: String?, stderr: String?, code: Int32) {
+        guard request == id else { return }
+        watchdog?.cancel()
+        watchdog = nil
+        request = nil
         process = nil
-
-        let sample = parsePingOutput(stdout, exitCode: exitCode, timestamp: Date())
-        deliver(sample)
+        deliver(parsePingOutput(stdout, exitCode: code, timestamp: Date(), stderr: stderr, startedAt: startedAt))
         scheduleNext()
     }
 
-    private func handleWatchdogFired(generation: Int) {
-        guard generation == self.generation, busy else { return }
+    private func timedOut(_ id: UUID) {
+        guard request == id else { return }
+        request = nil
         process?.terminationHandler = nil
         process?.terminate()
         process = nil
-        busy = false
-        deliver(PingSample(ok: false, rtt: -1, t: Date()))
+        watchdog = nil
+        deliver(PingSample(ok: false, rtt: -1, t: Date(), startedAt: startedAt, failure: .watchdog))
         scheduleNext()
     }
 
     private func scheduleNext() {
-        let elapsedMs = Date().timeIntervalSince(lastStart) * 1000
-        let delayMs = nextDelay(intervalMs: intervalMs, elapsedMs: elapsedMs, minGapMs: minGapMs)
-        let myGeneration = generation
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startedClock.uptimeNanoseconds) / 1_000_000
+        let delay = nextDelay(intervalMs: Double(target.interval * 1000), elapsedMs: elapsed, minGapMs: 50)
+        let token = session
         let item = DispatchWorkItem { [weak self] in
-            self?.queue.async {
-                guard self?.generation == myGeneration else { return }
-                self?.doPing()
-            }
+            guard let self, self.session == token else { return }
+            self.doPing()
         }
-        scheduledWorkItem = item
-        queue.asyncAfter(deadline: .now() + delayMs / 1000, execute: item)
+        scheduled = item
+        queue.asyncAfter(deadline: .now() + delay / 1000, execute: item)
     }
 
     private func deliver(_ sample: PingSample) {
-        let handler = onSample
-        DispatchQueue.main.async { handler?(sample) }
+        let callback = handler
+        let token = session
+        DispatchQueue.main.async { callback?(sample, token) }
     }
 }

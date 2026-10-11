@@ -49,22 +49,25 @@ final class Config: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
 
-        host = Self.loadString(defaults, Keys.host, "8.8.8.8")
-        pingInterval = Self.loadInt(defaults, Keys.pingInterval, 1)
-        pingTimeout = Self.loadInt(defaults, Keys.pingTimeout, 1)
+        host = MonitoringTarget.normalizedHost(Self.loadString(defaults, Keys.host, "8.8.8.8")) ?? "8.8.8.8"
+        pingInterval = min(60, max(1, Self.loadInt(defaults, Keys.pingInterval, 1)))
+        pingTimeout = min(60, max(1, Self.loadInt(defaults, Keys.pingTimeout, 1)))
         showLatencyText = Self.loadBool(defaults, Keys.showLatencyText, true)
-        defaultTimescale = Self.loadInt(defaults, Keys.defaultTimescale, 300)
+        let savedTimescale = Self.loadInt(defaults, Keys.defaultTimescale, 300)
+        defaultTimescale = [30, 60, 300, 900, 3600].contains(savedTimescale) ? savedTimescale : 300
 
         useCustomColors = Self.loadBool(defaults, Keys.useCustomColors, false)
         okColor = Color(hex: Self.loadString(defaults, Keys.okColor, "#27ae60"))
         warningColor = Color(hex: Self.loadString(defaults, Keys.warningColor, "#f67400"))
         criticalColor = Color(hex: Self.loadString(defaults, Keys.criticalColor, "#da4453"))
 
-        yellowAfter = Self.loadInt(defaults, Keys.yellowAfter, 2)
-        redAfter = Self.loadInt(defaults, Keys.redAfter, 5)
-        recoverAfter = Self.loadInt(defaults, Keys.recoverAfter, 5)
-        yellowMs = Self.loadInt(defaults, Keys.yellowMs, 150)
-        redMs = Self.loadInt(defaults, Keys.redMs, 500)
+        let warningCount = min(59, max(1, Self.loadInt(defaults, Keys.yellowAfter, 2)))
+        yellowAfter = warningCount
+        redAfter = min(60, max(warningCount + 1, Self.loadInt(defaults, Keys.redAfter, 5)))
+        recoverAfter = min(60, max(1, Self.loadInt(defaults, Keys.recoverAfter, 5)))
+        let warningLatency = min(9999, max(1, Self.loadInt(defaults, Keys.yellowMs, 150)))
+        yellowMs = warningLatency
+        redMs = min(10000, max(warningLatency + 1, Self.loadInt(defaults, Keys.redMs, 500)))
     }
 
     var thresholds: Thresholds {

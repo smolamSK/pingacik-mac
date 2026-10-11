@@ -46,6 +46,14 @@ func classify(_ sample: PingSample, _ cfg: Thresholds) -> Verdict {
     return .good
 }
 
+public func sampleStatus(_ sample: PingSample, thresholds: Thresholds) -> ConnectionStatus {
+    switch classify(sample, thresholds) {
+    case .good: return .ok
+    case .slowWarning: return .warning
+    case .slowCritical, .lost: return .critical
+    }
+}
+
 /// Hysteresis state machine: degrades immediately, recovers slowly.
 ///
 /// A worse verdict applies at once, but returning to OK requires
