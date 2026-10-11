@@ -8,6 +8,14 @@ The menu bar shows a status indicator and the current round-trip time in a stabl
 Click it for a latency summary, an RTT chart, and a live probe log. Checking, paused, and stale
 measurements use neutral indicators; warning and critical states include a symbol as well as color.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/pingacik-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/pingacik-light.png">
+  <img src="docs/images/pingacik-light.png" alt="Pingacik popup showing current latency, average latency, packet loss, a latency chart, and recent probes" width="440">
+</picture>
+
+*Pingacik’s popup with sample monitoring data. The screenshot follows your light or dark theme.*
+
 ## Install / run
 
 Requires Xcode (for the Swift toolchain) and macOS 14+.
